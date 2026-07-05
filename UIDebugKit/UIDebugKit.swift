@@ -4,8 +4,9 @@
 //
 //  WHAT IT GIVES YOU (no need to read code to measure your UI):
 //    • A floating 📏 button (DEBUG builds only) that opens a control panel.
-//    • Inspect       – touch any component and see its name + exact size, with
-//                      no per-view code. Works straight on any screen.
+//    • Inspect       – tap any component to see its size AND the spacing on all
+//                      4 sides (to its neighbour, or to the screen edge). Tap a
+//                      second component to measure the gap between the two.
 //    • Tape Measure  – drag two handles to read distance, horizontal (dx)
 //                      and vertical (dy) spacing in points between ANY two
 //                      points on screen. Perfect for "how much space is this?".
@@ -45,6 +46,20 @@ public extension View {
 
 #if DEBUG
 
+// MARK: - Models
+
+/// One measured gap on a side of the inspected element — to the nearest
+/// neighbouring element, or (when there is none) to the safe-area / screen edge.
+struct EdgeGap: Identifiable {
+    let id = UUID()
+    let from: CGPoint       // point on the selected element's edge
+    let to: CGPoint         // point on the boundary it was measured to
+    let value: CGFloat      // distance in points
+    let horizontal: Bool    // true = left/right gap, false = top/bottom gap
+    let toScreen: Bool      // measured to the screen / safe-area edge (no neighbour)
+    let targetRect: CGRect? // the neighbour it measured to, if any
+}
+
 // MARK: - Shared State
 
 /// Holds the on/off state of every tool. Single shared instance so the
@@ -75,13 +90,24 @@ final class UIDebugState: ObservableObject {
     @Published var pinnedAName: String = ""
     @Published var pinnedB: CGRect? = nil
     @Published var pinnedBName: String = ""
-    // Nearest neighbor in each direction, shown automatically when only A is pinned.
-    @Published var neighbors: [CGRect] = []
+    // The spacing on each of the 4 sides of pinned A — to the nearest element,
+    // or the safe-area / screen edge when there is no neighbour. Shown
+    // automatically while only A is selected.
+    @Published var edgeGaps: [EdgeGap] = []
+    // Current safe-area rectangle in window coordinates (target for edge gaps).
+    @Published var safeRectInWindow: CGRect = .zero
+
+    // Nesting: re-tapping the same spot steps A through the elements stacked
+    // under that point (smallest → parent → … → wrap).
+    var selectionAnchor: CGPoint? = nil
+    var selectionStack: [(rect: CGRect, name: String)] = []
+    var selectionIndex = 0
 
     func clearPins() {
         pinnedA = nil; pinnedAName = ""
         pinnedB = nil; pinnedBName = ""
-        neighbors = []
+        edgeGaps = []
+        selectionAnchor = nil; selectionStack = []; selectionIndex = 0
     }
 
     // Spacing check: flag gaps that aren't a multiple of the design grid unit.
@@ -116,6 +142,12 @@ struct UIDebugKitModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content
+            // While Inspect is on, freeze the app underneath: a tap should
+            // measure, not flip a toggle / push a button / scroll the screen.
+            // Our own overlays (floating button, panel, tape measure) are added
+            // after this and stay live; the window-level inspector still reads
+            // the touch location, so selection keeps working.
+            .allowsHitTesting(!state.showInspect)
             // Capture the real safe-area insets before we ignore them below.
             .background(
                 GeometryReader { geo in
@@ -277,7 +309,7 @@ private struct ControlPanel: View {
                 }
 
                 Section("How to use") {
-                    bullet("Inspect", "Drag a finger to size one element. Tap an element then tap a second to measure the exact gap between them; tap empty space to reset.")
+                    bullet("Inspect", "Tap any element to see its size and the spacing on all 4 sides — to its neighbour, or to the screen edge when nothing is beside it. Tap a second element to measure the exact gap between the two. Tap the same element again to grow the selection to its parent box (handy when a tap lands on the text instead of the card). Tap empty space to reset.")
                     bullet("Tape measure", "Drag the two circles to the edges you care about. Read distance, dx (horizontal) and dy (vertical) in points.")
                     bullet("Move me", "Drag the floating 📏 button anywhere it gets in the way.")
                 }
@@ -476,10 +508,12 @@ private struct LegendOverlay: View {
             if state.showInspect {
                 row(.pink, "Inspect",
                     state.pinnedA == nil
-                    ? "Tap an element to see gaps to its neighbors. Tap a second element to measure between the two. Drag = size."
+                    ? "Tap any element → its size + the spacing on all 4 sides (to a neighbour, or the screen edge). Tap a 2nd element to measure the gap between them."
                     : (state.pinnedB == nil
-                       ? "Gaps to neighbors shown. Tap a second element to measure A↔B, or empty space to reset."
-                       : "Gap between the two shown. Tap another element to re-measure, or empty space to reset."))
+                       ? (state.selectionStack.count > 1
+                          ? "Selected \(state.pinnedAName) — tap the SAME spot again to grow to its parent box (\(state.selectionIndex + 1)/\(state.selectionStack.count)). Tap another element to measure A↔B, empty space to reset."
+                          : "Size + 4-side spacing shown. Tap another element to measure A↔B, or empty space to reset.")
+                       : "Gap between A and B shown. Tap another element to re-measure, or empty space to reset."))
                 if state.checkGrid {
                     row(.green, "Spacing check",
                         "green = on the \(Int(state.gridBaseUnit)) pt grid · red = off-grid (→ shows the nearest on-grid value).")
@@ -525,33 +559,32 @@ private struct InspectHighlight: View {
     var body: some View {
         GeometryReader { _ in
             ZStack(alignment: .topLeading) {
-                // Neighbor gaps: shown around A until a second element is tapped.
+                // Live preview: a thin outline of whatever is under the finger,
+                // with no numbers, so it's obvious what a release will select.
+                if let p = state.inspectRect, p.width > 0, p.height > 0 {
+                    previewOutline(p)
+                }
+
+                // A selected, no B yet → its size + the gap on all 4 sides.
                 if let a = state.pinnedA, state.pinnedB == nil {
-                    ForEach(Array(state.neighbors.enumerated()), id: \.offset) { _, n in
-                        ZStack(alignment: .topLeading) {
-                            neighborOutline(n)
-                            gapLines(a, n)
-                        }
+                    ForEach(state.edgeGaps) { g in
+                        if let t = g.targetRect { neighborOutline(t) }
+                        dimension(g.from, g.to, g.value, horizontal: g.horizontal)
                     }
-                }
-                if let a = state.pinnedA {
                     outline(a, .blue)
-                    // In neighbor-overview mode the gap labels are the focus, so
-                    // hide A's size badge to avoid colliding with them.
-                    if state.pinnedB != nil || state.neighbors.isEmpty {
-                        badge(a, label(state.pinnedAName, a), .blue, above: true)
-                    }
+                    // Size sits in the centre so it never collides with the four
+                    // edge-gap labels hugging the sides.
+                    pill(label(state.pinnedAName, a), .blue)
+                        .position(x: a.midX, y: a.midY)
                 }
-                if let b = state.pinnedB {
+
+                // A and B selected → the focused gap between the two.
+                if let a = state.pinnedA, let b = state.pinnedB {
+                    outline(a, .blue)
+                    badge(a, label(state.pinnedAName, a), .blue, above: true)
                     outline(b, .green)
                     badge(b, label(state.pinnedBName, b), .green, above: false)
-                }
-                if let a = state.pinnedA, let b = state.pinnedB {
-                    gapLines(a, b)                       // focused A↔B measurement
-                } else if state.pinnedA == nil,
-                          let r = state.inspectRect, r.width > 0, r.height > 0 {
-                    outline(r, .pink)                    // live hover (drag = size)
-                    badge(r, label(state.inspectName, r), .pink, above: true)
+                    gapLines(a, b)
                 }
             }
         }
@@ -559,6 +592,14 @@ private struct InspectHighlight: View {
     }
 
     // MARK: pieces
+
+    /// Thin dashed outline of the element under the finger (preview, no numbers).
+    private func previewOutline(_ r: CGRect) -> some View {
+        Rectangle()
+            .stroke(Color.pink.opacity(0.9), style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+            .frame(width: r.width, height: r.height)
+            .position(x: r.midX, y: r.midY)
+    }
 
     private func outline(_ r: CGRect, _ color: Color) -> some View {
         ZStack {
@@ -794,48 +835,58 @@ private struct InspectorInstaller: UIViewRepresentable {
             guard let window else { return }
             let point = g.location(in: window)
             switch g.state {
-            case .began:
-                touchStart = point
-                didDrag = false
-                report(at: point, in: window)
-            case .changed:
-                if hypot(point.x - touchStart.x, point.y - touchStart.y) > 10 { didDrag = true }
-                report(at: point, in: window)
-            case .ended:
-                if !didDrag { handleTap(at: point, in: window) }  // a tap pins for gap measurement
+            case .began, .changed:
+                preview(at: point, in: window)            // thin outline follows the finger
+            case .ended, .cancelled:
+                UIDebugState.shared.inspectRect = nil     // drop the preview…
+                handleTap(at: point, in: window)          // …release = select / measure
             default:
                 break
             }
         }
 
-        /// Drag = live size readout of the element under the finger.
-        private func report(at point: CGPoint, in window: UIWindow) {
-            if let hit = UIDebugInspector.hit(at: point, in: window) {
-                UIDebugState.shared.inspectRect = hit.rect
-                UIDebugState.shared.inspectName = hit.name
-            }
+        /// While the finger is down, outline whatever is under it (no numbers).
+        private func preview(at point: CGPoint, in window: UIWindow) {
+            UIDebugState.shared.inspectRect = UIDebugInspector.hit(at: point, in: window)?.rect
         }
 
-        /// Tap = pin element A, then B (to measure the gap), then reset.
+        /// Tap = pin A, then B (gap), then reset. Re-tapping the same spot while
+        /// choosing A steps up through the nested elements stacked under it.
         private func handleTap(at point: CGPoint, in window: UIWindow) {
             let s = UIDebugState.shared
-            guard let hit = UIDebugInspector.hit(at: point, in: window) else { s.clearPins(); return }
-            // Tapping (almost) the whole screen = empty space → reset.
-            let screenArea = window.bounds.width * window.bounds.height
-            if hit.rect.width * hit.rect.height > 0.8 * screenArea { s.clearPins(); return }
+
+            // Re-tap (almost) the same spot while only A is selected → grow the
+            // selection to its parent box (smallest → parent → … → wrap). This is
+            // how you grab the container instead of the text sitting inside it.
+            if s.pinnedA != nil, s.pinnedB == nil,
+               let anchor = s.selectionAnchor,
+               hypot(point.x - anchor.x, point.y - anchor.y) < 22,
+               s.selectionStack.count > 1 {
+                s.selectionIndex = (s.selectionIndex + 1) % s.selectionStack.count
+                let sel = s.selectionStack[s.selectionIndex]
+                s.pinnedA = sel.rect; s.pinnedAName = sel.name
+                s.edgeGaps = UIDebugInspector.edges(of: sel.rect, in: window)
+                return
+            }
+
+            let stack = UIDebugInspector.stack(at: point, in: window)
+            guard let smallest = stack.first else { s.clearPins(); return }  // empty space → reset
+
+            func selectAsA() {
+                s.selectionAnchor = point; s.selectionStack = stack; s.selectionIndex = 0
+                s.pinnedA = smallest.rect; s.pinnedAName = smallest.name
+                s.pinnedB = nil; s.pinnedBName = ""
+                s.edgeGaps = UIDebugInspector.edges(of: smallest.rect, in: window)
+            }
 
             if s.pinnedA == nil {
-                s.pinnedA = hit.rect; s.pinnedAName = hit.name
-                s.pinnedB = nil; s.pinnedBName = ""
-                s.neighbors = UIDebugInspector.neighbors(of: hit.rect, in: window)
+                selectAsA()                                    // 1st tap → inspect A
             } else if s.pinnedB == nil {
-                if hit.rect == s.pinnedA { return }            // same element — ignore
-                s.pinnedB = hit.rect; s.pinnedBName = hit.name
-                s.neighbors = []                               // focused A↔B measurement
+                if smallest.rect == s.pinnedA { return }       // same element — ignore
+                s.pinnedB = smallest.rect; s.pinnedBName = smallest.name
+                s.edgeGaps = []                                // focus the A↔B gap
             } else {
-                s.pinnedA = hit.rect; s.pinnedAName = hit.name // start a new measurement
-                s.pinnedB = nil; s.pinnedBName = ""
-                s.neighbors = UIDebugInspector.neighbors(of: hit.rect, in: window)
+                selectAsA()                                    // 3rd tap → start over
             }
         }
 
@@ -860,6 +911,30 @@ enum UIDebugInspector {
         return (rectInWindow, best.name)
     }
 
+    /// Every accessibility element stacked under a point — leaves *and* their
+    /// container groups — sorted smallest → largest. Lets the caller step from
+    /// a child element up through its parents. (Atomic controls like Button
+    /// expose only one element, so there is nothing smaller to step into.)
+    static func stack(at windowPoint: CGPoint, in window: UIWindow) -> [(rect: CGRect, name: String)] {
+        let screenSpace = window.screen.coordinateSpace
+        let screenPoint = window.coordinateSpace.convert(windowPoint, to: screenSpace)
+        let root: NSObject = window.rootViewController?.view ?? window
+        let screenArea = window.bounds.width * window.bounds.height
+        var hits: [(rect: CGRect, name: String)] = []
+        func visit(_ e: NSObject) {
+            let f = e.accessibilityFrame
+            if !f.isEmpty, f.contains(screenPoint), f.width * f.height < 0.95 * screenArea {
+                hits.append((window.coordinateSpace.convert(f, from: screenSpace), name(for: e)))
+            }
+            childrenOf(e).forEach(visit)
+        }
+        visit(root)
+        let sorted = hits.sorted { $0.rect.width * $0.rect.height < $1.rect.width * $1.rect.height }
+        var result: [(rect: CGRect, name: String)] = []
+        for item in sorted where !result.contains(where: { $0.rect == item.rect }) { result.append(item) }
+        return result
+    }
+
     /// SwiftUI only builds its accessibility tree (which carries the element
     /// frames we read) when an assistive service is active. This flips the
     /// in-process accessibility switch so the tree exists for us to walk.
@@ -877,53 +952,125 @@ enum UIDebugInspector {
         unsafeBitCast(sym, to: Fn.self)(true)
     }
 
-    /// Nearest neighbor element of `target` in each direction (up/down/left/right),
-    /// used to show all surrounding gaps at once when one element is pinned.
-    static func neighbors(of target: CGRect, in window: UIWindow) -> [CGRect] {
-        let screenArea = window.bounds.width * window.bounds.height
-        let candidates = allLeafFrames(in: window).filter { c in
-            c != target
-            && c.width * c.height < 0.8 * screenArea          // not the full-screen container
-            && !c.intersects(target.insetBy(dx: 1, dy: 1))    // not self / parent / child
+    /// The spacing on each of the 4 sides of `a` — to the nearest neighbouring
+    /// element, or (when nothing is on that side) to the safe-area / screen edge.
+    /// Measuring to the edge is what makes "how far from the screen edge?" work,
+    /// and including container frames (not just text leaves) lets a box's edge
+    /// win over the text inside it.
+    static func edges(of a: CGRect, in window: UIWindow) -> [EdgeGap] {
+        let safe = window.bounds.inset(by: window.safeAreaInsets)
+        UIDebugState.shared.safeRectInWindow = safe
+
+        let candidates = allFrames(in: window).filter { c in
+            !approxEqual(c, a) && !c.intersects(a.insetBy(dx: 1, dy: 1))  // not self / parent / child
         }
-        var result: [CGRect] = []
-        // below & above must share horizontal extent; left & right share vertical.
-        if let below = candidates
-            .filter({ $0.minY >= target.maxY - 0.5 && overlaps($0.minX, $0.maxX, target.minX, target.maxX) })
-            .min(by: { $0.minY < $1.minY }) { result.append(below) }
-        if let above = candidates
-            .filter({ $0.maxY <= target.minY + 0.5 && overlaps($0.minX, $0.maxX, target.minX, target.maxX) })
-            .max(by: { $0.maxY < $1.maxY }) { result.append(above) }
-        if let right = candidates
-            .filter({ $0.minX >= target.maxX - 0.5 && overlaps($0.minY, $0.maxY, target.minY, target.maxY) })
-            .min(by: { $0.minX < $1.minX }) { result.append(right) }
-        if let left = candidates
-            .filter({ $0.maxX <= target.minX + 0.5 && overlaps($0.minY, $0.maxY, target.minY, target.maxY) })
-            .max(by: { $0.maxX < $1.maxX }) { result.append(left) }
-        return result
+        var gaps: [EdgeGap] = []
+
+        // TOP — nearest element above (sharing horizontal extent) vs the safe top.
+        let above = candidates
+            .filter { $0.maxY <= a.minY + 0.5 && overlaps($0.minX, $0.maxX, a.minX, a.maxX) }
+            .max(by: { $0.maxY < $1.maxY })
+        if let g = pickEdge(neighbor: above.map { a.minY - $0.maxY }, edge: a.minY - safe.minY) {
+            let x = g.fromElement ? overlapMid(a.minX, a.maxX, above!.minX, above!.maxX, fallback: a.midX)
+                                  : clamp(a.midX, safe.minX + 4, safe.maxX - 4)
+            gaps.append(EdgeGap(from: CGPoint(x: x, y: a.minY),
+                                to: CGPoint(x: x, y: g.fromElement ? above!.maxY : safe.minY),
+                                value: g.value, horizontal: false,
+                                toScreen: !g.fromElement, targetRect: g.fromElement ? above : nil))
+        }
+
+        // BOTTOM
+        let below = candidates
+            .filter { $0.minY >= a.maxY - 0.5 && overlaps($0.minX, $0.maxX, a.minX, a.maxX) }
+            .min(by: { $0.minY < $1.minY })
+        if let g = pickEdge(neighbor: below.map { $0.minY - a.maxY }, edge: safe.maxY - a.maxY) {
+            let x = g.fromElement ? overlapMid(a.minX, a.maxX, below!.minX, below!.maxX, fallback: a.midX)
+                                  : clamp(a.midX, safe.minX + 4, safe.maxX - 4)
+            gaps.append(EdgeGap(from: CGPoint(x: x, y: a.maxY),
+                                to: CGPoint(x: x, y: g.fromElement ? below!.minY : safe.maxY),
+                                value: g.value, horizontal: false,
+                                toScreen: !g.fromElement, targetRect: g.fromElement ? below : nil))
+        }
+
+        // LEFT
+        let left = candidates
+            .filter { $0.maxX <= a.minX + 0.5 && overlaps($0.minY, $0.maxY, a.minY, a.maxY) }
+            .max(by: { $0.maxX < $1.maxX })
+        if let g = pickEdge(neighbor: left.map { a.minX - $0.maxX }, edge: a.minX - safe.minX) {
+            let y = g.fromElement ? overlapMid(a.minY, a.maxY, left!.minY, left!.maxY, fallback: a.midY)
+                                  : clamp(a.midY, safe.minY + 4, safe.maxY - 4)
+            gaps.append(EdgeGap(from: CGPoint(x: a.minX, y: y),
+                                to: CGPoint(x: g.fromElement ? left!.maxX : safe.minX, y: y),
+                                value: g.value, horizontal: true,
+                                toScreen: !g.fromElement, targetRect: g.fromElement ? left : nil))
+        }
+
+        // RIGHT
+        let right = candidates
+            .filter { $0.minX >= a.maxX - 0.5 && overlaps($0.minY, $0.maxY, a.minY, a.maxY) }
+            .min(by: { $0.minX < $1.minX })
+        if let g = pickEdge(neighbor: right.map { $0.minX - a.maxX }, edge: safe.maxX - a.maxX) {
+            let y = g.fromElement ? overlapMid(a.minY, a.maxY, right!.minY, right!.maxY, fallback: a.midY)
+                                  : clamp(a.midY, safe.minY + 4, safe.maxY - 4)
+            gaps.append(EdgeGap(from: CGPoint(x: a.maxX, y: y),
+                                to: CGPoint(x: g.fromElement ? right!.minX : safe.maxX, y: y),
+                                value: g.value, horizontal: true,
+                                toScreen: !g.fromElement, targetRect: g.fromElement ? right : nil))
+        }
+
+        return gaps
+    }
+
+    /// Picks between the neighbour gap and the safe-area edge gap — the nearer
+    /// one wins. Returns nil for non-positive / negligible gaps.
+    private struct EdgePick { let value: CGFloat; let fromElement: Bool }
+    private static func pickEdge(neighbor: CGFloat?, edge: CGFloat) -> EdgePick? {
+        var best: EdgePick?
+        if let n = neighbor, n >= -0.5 { best = EdgePick(value: max(n, 0), fromElement: true) }
+        if edge >= -0.5, best == nil || edge < best!.value - 0.01 {
+            best = EdgePick(value: max(edge, 0), fromElement: false)
+        }
+        if let b = best, b.value < 0.5 { return nil }   // ignore zero / flush edges
+        return best
     }
 
     private static func overlaps(_ lo1: CGFloat, _ hi1: CGFloat, _ lo2: CGFloat, _ hi2: CGFloat) -> Bool {
         max(lo1, lo2) < min(hi1, hi2)
     }
 
-    /// Every leaf accessibility frame in the app, in window coordinates.
-    private static func allLeafFrames(in window: UIWindow) -> [CGRect] {
-        let screenSpace = window.screen.coordinateSpace
-        let root: NSObject = window.rootViewController?.view ?? window
-        var leaves: [CGRect] = []
-        collectLeaves(root, into: &leaves)
-        return leaves.map { window.coordinateSpace.convert($0, from: screenSpace) }
+    private static func overlapMid(_ lo1: CGFloat, _ hi1: CGFloat, _ lo2: CGFloat, _ hi2: CGFloat, fallback: CGFloat) -> CGFloat {
+        let lo = max(lo1, lo2), hi = min(hi1, hi2)
+        return hi > lo ? (lo + hi) / 2 : fallback
     }
 
-    private static func collectLeaves(_ element: NSObject, into leaves: inout [CGRect]) {
-        let children = childrenOf(element)
-        if children.isEmpty {
-            let f = element.accessibilityFrame
-            if !f.isEmpty { leaves.append(f) }
-        } else {
-            for child in children { collectLeaves(child, into: &leaves) }
+    private static func clamp(_ v: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
+        lo <= hi ? min(max(v, lo), hi) : v
+    }
+
+    private static func approxEqual(_ a: CGRect, _ b: CGRect) -> Bool {
+        abs(a.minX - b.minX) < 0.5 && abs(a.minY - b.minY) < 0.5 &&
+        abs(a.width - b.width) < 0.5 && abs(a.height - b.height) < 0.5
+    }
+
+    /// Every accessibility frame in the app (containers *and* leaves), in window
+    /// coordinates. Including containers lets a box's edge win over the text
+    /// inside it when picking the nearest neighbour.
+    private static func allFrames(in window: UIWindow) -> [CGRect] {
+        let screenSpace = window.screen.coordinateSpace
+        let root: NSObject = window.rootViewController?.view ?? window
+        let screenArea = window.bounds.width * window.bounds.height
+        var out: [CGRect] = []
+        func visit(_ e: NSObject) {
+            let f = e.accessibilityFrame
+            if !f.isEmpty, f.width * f.height < 0.9 * screenArea {   // drop full-screen containers
+                out.append(window.coordinateSpace.convert(f, from: screenSpace))
+            }
+            childrenOf(e).forEach(visit)
         }
+        visit(root)
+        var result: [CGRect] = []
+        for r in out where !result.contains(where: { approxEqual($0, r) }) { result.append(r) }
+        return result
     }
 
     private static func search(_ element: NSObject, point: CGPoint,
@@ -942,10 +1089,24 @@ enum UIDebugInspector {
     }
 
     private static func childrenOf(_ element: NSObject) -> [NSObject] {
-        if let els = element.accessibilityElements as? [NSObject], !els.isEmpty { return els }
-        let count = element.accessibilityElementCount()
-        guard count > 0, count != NSNotFound else { return [] }
-        return (0..<count).compactMap { element.accessibilityElement(at: $0) as? NSObject }
+        var result: [NSObject] = []
+        if let els = element.accessibilityElements as? [NSObject], !els.isEmpty {
+            result += els
+        } else {
+            let count = element.accessibilityElementCount()
+            if count > 0, count != NSNotFound {
+                result += (0..<count).compactMap { element.accessibilityElement(at: $0) as? NSObject }
+            }
+        }
+        // Also descend the UIView tree: in NavigationStack / ScrollView apps the
+        // content's accessibility elements live under intermediate UIViews whose
+        // own `accessibilityElements` are empty. Skip our own hidden overlays.
+        if let view = element as? UIView {
+            for sub in view.subviews where !sub.accessibilityElementsHidden && !sub.isHidden && sub.alpha > 0.01 {
+                result.append(sub)
+            }
+        }
+        return result
     }
 
     private static func name(for element: NSObject) -> String {

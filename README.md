@@ -20,9 +20,10 @@ Xcode View Hierarchy, no reading code, no annotations.
 
 ## ✨ Features
 
-- 🔍 **Inspect** — touch any component (no code) and see its **name + exact size**.
-- 🎯 **Auto neighbor gaps** — tap one element to see the spacing to its nearest
-  neighbor in **every direction** at once, just like selecting a layer in Figma.
+- 🔍 **Inspect** — tap any component (no code) and see its **exact size** plus
+  the **spacing on all 4 sides** at once: to its nearest neighbor, **or to the
+  screen / safe‑area edge** when nothing is beside it. One tap answers both
+  "how big is it?" and "how much padding all around?".
 - 📐 **Gap between two elements** — tap A, tap B, read the exact gap with a
   dimension line.
 - 🚦 **Off‑grid checker** — every gap is color‑coded 🟢 on‑grid / 🔴 off‑grid
@@ -85,7 +86,7 @@ Open the panel with the floating **📏** button, then toggle a tool:
 
 | Tool | What to do |
 |------|------------|
-| **Inspect** | *Drag* a finger to size one element. *Tap* an element to see gaps to its neighbors. *Tap a second* element to measure the gap between the two. *Tap empty space* to reset. |
+| **Inspect** | *Tap* any element → its **size + the spacing on all 4 sides** (to a neighbor, or the **screen edge** when nothing's beside it). *Tap the same spot again* to grow the selection to its **parent box** (use this when a tap lands on the text instead of the card around it). *Tap a second* element to measure the **gap between the two**. *Tap empty space* to reset. While your finger is down it just previews an outline — you only select on release, so size and spacing never flicker between modes. |
 | **Tape measure** | Drag the two circles to the edges you care about — read `distance`, `dx` and `dy`. |
 | **Grid overlay** | Shows an 8 pt (configurable) grid with bold major lines. |
 | **Safe area** | Outlines the safe area and prints the inset values. |
@@ -103,10 +104,17 @@ Open the panel with the floating **📏** button, then toggle a tool:
   switch (`_AXSSetAutomationEnabled`, a private symbol). Because the kit is
   entirely inside `#if DEBUG`, this never reaches the App Store — but Inspect
   only works in Debug builds. The other tools use **public API only**.
-- **Accuracy.** Inspect is exact for text, buttons, rows and most controls;
-  for images/SF Symbols it reports the visual glyph bounds, and purely
-  decorative content with no accessibility info can’t be detected (use the tape
-  measure for those).
+- **Accuracy.** Inspect is exact for text, buttons, rows and most controls — it
+  measures **box‑edge to box‑edge** for those.
+- **Background cards measure to their content.** A card drawn with
+  `.background(Color…)` is **not** in the accessibility tree (SwiftUI never adds
+  it), so no automatic tool — DevTools‑for‑SwiftUI included — can see that
+  rectangle. For those, a side gap is measured to the **content edge** (e.g. the
+  text inside the card), which can read a little larger than the visible card
+  edge by the card's internal padding. Two ways to handle it: *tap the same spot
+  again* to grow the selection up to a container that **is** in the tree, or rely
+  on the **screen / safe‑area edge** fallback (always exact). For a purely visual
+  rectangle, the **tape measure** reads it directly.
 
 ---
 
